@@ -1221,6 +1221,234 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
+class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
+    """
+    KV cache pool using TurboQuant MSE-optimal 4-bit (or 8-bit) quantization.
+
+    Encoding per (token, head) vector x ∈ R^d:
+      - Apply random rotation Π, quantise each coordinate to n_bits using a
+        precomputed Lloyd-Max codebook for N(0, 1/d).
+      - Store: packed uint8 indices + float16 L2-norm.
+
+    Compression ratio ≈ 16 / (n_bits + 16/d) compared to bfloat16.
+    For n_bits=4, d=128: ~3.9× smaller than bfloat16.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        n_bits: int = 4,
+        v_head_dim: Optional[int] = None,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
+    ):
+        # n_bits must be set before super().__init__ because that calls _create_buffers
+        self.n_bits = n_bits
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            v_head_dim=v_head_dim,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=enable_alt_stream,
+            # KV-copy is not supported for TurboQuant (requires special handling)
+            enable_kv_cache_copy=False,
+        )
+        # Build quantisers (after head_dim / v_head_dim are set by parent)
+        from sglang.srt.layers.quantization.turboquant import TurboQuantizerMSE
+
+        self.k_quantizer = TurboQuantizerMSE(self.head_dim, n_bits=n_bits, device=device)
+        if self.v_head_dim != self.head_dim:
+            self.v_quantizer = TurboQuantizerMSE(
+                self.v_head_dim, n_bits=n_bits, device=device
+            )
+        else:
+            self.v_quantizer = self.k_quantizer
+
+    # ------------------------------------------------------------------
+    # Buffer creation / destruction
+    # ------------------------------------------------------------------
+
+    def _create_buffers(self):
+        n_bits = getattr(self, "n_bits", 4)
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                n = self.head_num
+                k = self.head_dim
+                vk = self.v_head_dim
+
+                # Override: packed uint8 storage
+                self.store_dtype = torch.uint8
+
+                # Number of bytes needed per vector after packing
+                k_packed_dim = (k * n_bits + 7) // 8   # = k//2 for 4-bit
+                vk_packed_dim = (vk * n_bits + 7) // 8
+
+                # Packed index buffers
+                self.k_buffer = [
+                    torch.zeros(
+                        (m, n, k_packed_dim), dtype=torch.uint8, device=self.device
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (m, n, vk_packed_dim), dtype=torch.uint8, device=self.device
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                # Norm / scale buffers (float16, one scalar per head vector)
+                self.k_scale_buffer = [
+                    torch.zeros((m, n), dtype=torch.float16, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                self.v_scale_buffer = [
+                    torch.zeros((m, n), dtype=torch.float16, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+
+        # Pointer metadata required by parent / move_kv_cache infra
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        del self.k_scale_buffer
+        del self.v_scale_buffer
+
+    # ------------------------------------------------------------------
+    # Buffer accessors (dequantise on read)
+    # ------------------------------------------------------------------
+
+    def _get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        k_packed = self.k_buffer[layer_id - self.start_layer]    # [m, n, packed_dim]
+        k_norms = self.k_scale_buffer[layer_id - self.start_layer]  # [m, n]
+        m, n = k_norms.shape
+        k_dequant = self.k_quantizer.dequantize(
+            k_packed.reshape(m * n, -1), k_norms.reshape(m * n)
+        )
+        return k_dequant.reshape(m, n, self.head_dim)
+
+    def _get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        v_packed = self.v_buffer[layer_id - self.start_layer]
+        v_norms = self.v_scale_buffer[layer_id - self.start_layer]
+        m, n = v_norms.shape
+        v_dequant = self.v_quantizer.dequantize(
+            v_packed.reshape(m * n, -1), v_norms.reshape(m * n)
+        )
+        return v_dequant.reshape(m, n, self.v_head_dim)
+
+    # ------------------------------------------------------------------
+    # KV cache write (quantise on write)
+    # ------------------------------------------------------------------
+
+    def set_kv_buffer(
+        self,
+        layer,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        layer_id = layer_id_override if layer_id_override is not None else layer.layer_id
+
+        # Bring to the logical dtype (bfloat16) first
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k = cache_k.to(torch.float32).div_(k_scale)
+            if v_scale is not None:
+                cache_v = cache_v.to(torch.float32).div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        n_tokens = cache_k.shape[0]
+
+        # Quantise keys: [n_tokens, head_num, head_dim] → [n_tokens, head_num, packed_dim]
+        k_flat = cache_k.reshape(n_tokens * self.head_num, self.head_dim)
+        k_packed, k_norms = self.k_quantizer.quantize(k_flat)
+        k_packed = k_packed.reshape(n_tokens, self.head_num, -1)
+        k_norms = k_norms.reshape(n_tokens, self.head_num)
+
+        # Quantise values: [n_tokens, head_num, v_head_dim] → [n_tokens, head_num, packed_dim]
+        v_flat = cache_v.reshape(n_tokens * self.head_num, self.v_head_dim)
+        v_packed, v_norms = self.v_quantizer.quantize(v_flat)
+        v_packed = v_packed.reshape(n_tokens, self.head_num, -1)
+        v_norms = v_norms.reshape(n_tokens, self.head_num)
+
+        layer_idx = layer_id - self.start_layer
+        self.k_buffer[layer_idx][loc] = k_packed
+        self.v_buffer[layer_idx][loc] = v_packed
+        self.k_scale_buffer[layer_idx][loc] = k_norms
+        self.v_scale_buffer[layer_idx][loc] = v_norms
+
+    # ------------------------------------------------------------------
+    # Cache movement (used by speculative decoding / radix cache)
+    # ------------------------------------------------------------------
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if tgt_loc.numel() == 0:
+            return
+        for layer_idx in range(self.layer_num):
+            self.k_buffer[layer_idx][tgt_loc] = self.k_buffer[layer_idx][src_loc]
+            self.v_buffer[layer_idx][tgt_loc] = self.v_buffer[layer_idx][src_loc]
+            self.k_scale_buffer[layer_idx][tgt_loc] = self.k_scale_buffer[layer_idx][src_loc]
+            self.v_scale_buffer[layer_idx][tgt_loc] = self.v_scale_buffer[layer_idx][src_loc]
+
+    # ------------------------------------------------------------------
+    # Size reporting (includes both packed data and norm buffers)
+    # ------------------------------------------------------------------
+
+    def get_kv_size_bytes(self):
+        k_size = sum(
+            t.nbytes + self.k_scale_buffer[i].nbytes
+            for i, t in enumerate(self.k_buffer)
+        )
+        v_size = sum(
+            t.nbytes + self.v_scale_buffer[i].nbytes
+            for i, t in enumerate(self.v_buffer)
+        )
+        return k_size, v_size
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 

@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
+    MHATokenToKVPoolTurboQuant,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
@@ -70,6 +71,15 @@ _is_npu = is_npu()
 
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
+        if self.server_args.kv_cache_dtype == "turboquant":
+            # 4-bit packed indices (head_dim // 2 bytes) + float16 norm (2 bytes) per head
+            n_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
+            head_dim = self.model_config.head_dim
+            v_head_dim = getattr(self.model_config, "v_head_dim", None) or head_dim
+            # k: packed + norm,  v: packed + norm
+            k_bytes = n_heads * (head_dim // 2 + 2)
+            v_bytes = n_heads * (v_head_dim // 2 + 2)
+            return num_layers * (k_bytes + v_bytes)
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
             cell_size = (
@@ -663,7 +673,23 @@ class ModelRunnerKVCacheMixin:
                     **extra_args,
                 )
             else:
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                if self.server_args.kv_cache_dtype == "turboquant":
+                    self.token_to_kv_pool = MHATokenToKVPoolTurboQuant(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=torch.bfloat16,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        enable_alt_stream=not self.server_args.enable_pdmux,
+                    )
+                elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
