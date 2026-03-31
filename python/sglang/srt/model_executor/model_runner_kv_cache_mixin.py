@@ -331,21 +331,39 @@ class ModelRunnerKVCacheMixin:
         #   full_tokens = total_memory / (F * n_full + r * S * n_swa)
         #               = token_capacity * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
 
-        kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        if self.server_args.kv_cache_dtype == "turboquant":
+            # 4-bit packed (head_dim // 2 bytes) + float16 scale (2 bytes) per head, per k and v
+            def _turboquant_per_token(n_heads, head_dim, v_head_dim):
+                k_bytes = n_heads * (head_dim // 2 + 2)
+                v_bytes = n_heads * (v_head_dim // 2 + 2)
+                return k_bytes + v_bytes
 
-        # Full layer per-token memory
-        full_per_token = (
-            self.model_config.get_num_kv_heads(get_attention_tp_size())
-            * (self.model_config.head_dim + self.model_config.v_head_dim)
-            * kv_size
-        )
+            full_per_token = _turboquant_per_token(
+                self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                self.model_config.head_dim,
+                self.model_config.v_head_dim,
+            )
+            swa_per_token = _turboquant_per_token(
+                self.model_config.get_swa_num_kv_heads(get_attention_tp_size()),
+                self.model_config.swa_head_dim,
+                self.model_config.swa_v_head_dim,
+            )
+        else:
+            kv_size = torch._utils._element_size(self.kv_cache_dtype)
 
-        # SWA layer per-token memory
-        swa_per_token = (
-            self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
-            * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
-            * kv_size
-        )
+            # Full layer per-token memory
+            full_per_token = (
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                * (self.model_config.head_dim + self.model_config.v_head_dim)
+                * kv_size
+            )
+
+            # SWA layer per-token memory
+            swa_per_token = (
+                self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
+                * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
+                * kv_size
+            )
 
         # Total memory available from profile
         total_memory = token_capacity * (
