@@ -29,7 +29,7 @@ a 1-bit QJL transform on the residual for unbiased inner product estimation.
 
 import math
 from functools import lru_cache
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -250,6 +250,26 @@ class TurboQuantizerMSE:
         else:  # 8-bit
             self.packed_dim = head_dim
 
+        # ------------------------------------------------------------------
+        # bfloat16 fast-path for dequantisation
+        # rotation_bf16: used instead of float32 rotation to avoid large fp32 intermediates.
+        # byte_table_lo / byte_table_hi: pre-computed 256-entry lookup tables mapping
+        # each possible packed byte value to its lo/hi nibble codebook values in bf16.
+        # This replaces the full [N, head_dim] int64 indices tensor with a half-sized
+        # [N, head_dim//2] int64 tensor (one lookup per packed byte, not per index).
+        # ------------------------------------------------------------------
+        self.rotation_bf16: torch.Tensor = self.rotation.to(torch.bfloat16)
+
+        if n_bits == 4:
+            byte_vals = torch.arange(256, dtype=torch.int64, device=device)
+            lo_idx = byte_vals & 0x0F          # lower nibble
+            hi_idx = (byte_vals >> 4) & 0x0F   # upper nibble
+            self.byte_table_lo: torch.Tensor = self.codebook[lo_idx].to(torch.bfloat16)
+            self.byte_table_hi: torch.Tensor = self.codebook[hi_idx].to(torch.bfloat16)
+        else:
+            # 8-bit: full codebook in bf16, used directly
+            self.codebook_bf16: torch.Tensor = self.codebook.to(torch.bfloat16)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -290,7 +310,10 @@ class TurboQuantizerMSE:
 
     @torch.no_grad()
     def dequantize(
-        self, packed: torch.Tensor, norms: torch.Tensor
+        self,
+        packed: torch.Tensor,
+        norms: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Dequantise a batch of packed vectors.
@@ -298,22 +321,41 @@ class TurboQuantizerMSE:
         Args:
             packed: uint8 tensor [N, packed_dim]
             norms:  float16 tensor [N]
+            out:    optional pre-allocated bfloat16 tensor [N, head_dim] to write into.
+                    When provided, no new output tensor is allocated (CUDA-graph friendly).
 
         Returns:
-            x_hat: bfloat16 tensor [N, head_dim]
+            x_hat: bfloat16 tensor [N, head_dim]  (== out when out is not None)
         """
-        indices = self._unpack(packed)         # [N, d], int64
+        N = packed.shape[0]
 
-        # Retrieve centroid values
-        y = self.codebook[indices]             # [N, d], float32
+        if self.n_bits == 4:
+            # Use byte_table_{lo,hi} to look up codebook values in bf16 without
+            # materialising a full [N, head_dim] int64 indices tensor.
+            # packed is [N, d//2] uint8; .long() gives [N, d//2] int64 (half the
+            # original [N, d] int64 tensor, halving peak memory during capture).
+            byte_idx = packed.view(-1).long()              # [N * d//2], int64
+            lo_flat = self.byte_table_lo[byte_idx]         # [N * d//2], bfloat16
+            hi_flat = self.byte_table_hi[byte_idx]         # [N * d//2], bfloat16
+            d_half = packed.shape[1]
 
-        # Inverse rotation:  x_unit ≈ y @ Π
-        x_unit = y @ self.rotation             # [N, d]
+            # Interleave lo (even positions) and hi (odd positions) into y [N, d] bf16
+            y = torch.empty(N, d_half * 2, dtype=torch.bfloat16, device=packed.device)
+            y[:, 0::2] = lo_flat.view(N, d_half)
+            y[:, 1::2] = hi_flat.view(N, d_half)
+        else:
+            # 8-bit: one index per element, use full bf16 codebook
+            idx = packed.view(-1).long()
+            y = self.codebook_bf16[idx].view(N, -1)        # [N, d], bfloat16
 
-        # Re-scale by stored norms
-        x = x_unit * norms.to(torch.float32).unsqueeze(-1)  # [N, d]
+        # Inverse rotation and norm rescaling, all in bfloat16
+        if out is not None:
+            torch.mm(y, self.rotation_bf16, out=out)       # write directly into caller's buffer
+        else:
+            out = y @ self.rotation_bf16                   # [N, d], bfloat16
 
-        return x.to(torch.bfloat16)
+        out.mul_(norms.to(torch.bfloat16).unsqueeze(-1))
+        return out
 
     # ------------------------------------------------------------------
     # Packing helpers

@@ -1280,6 +1280,22 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         else:
             self.v_quantizer = self.k_quantizer
 
+        # Pre-allocate shared dequantised output buffers (one per pool, NOT per layer).
+        # Layers run sequentially so a single shared buffer is sufficient.
+        # Allocating these before CUDA graph capture keeps them in the main memory pool
+        # rather than any graph's private pool, preventing per-capture OOM accumulation.
+        m = self.size + self.page_size
+        self._k_dequant_out = torch.empty(
+            (m, self.head_num, self.head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self._v_dequant_out = torch.empty(
+            (m, self.head_num, self.v_head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
     # ------------------------------------------------------------------
     # Buffer creation / destruction
     # ------------------------------------------------------------------
@@ -1361,19 +1377,21 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         k_packed = self.k_buffer[layer_id - self.start_layer]    # [m, n, packed_dim]
         k_norms = self.k_scale_buffer[layer_id - self.start_layer]  # [m, n]
         m, n = k_norms.shape
-        k_dequant = self.k_quantizer.dequantize(
-            k_packed.reshape(m * n, -1), k_norms.reshape(m * n)
+        out = self._k_dequant_out.reshape(m * n, self.head_dim)
+        self.k_quantizer.dequantize(
+            k_packed.reshape(m * n, -1), k_norms.reshape(m * n), out=out
         )
-        return k_dequant.reshape(m, n, self.head_dim)
+        return self._k_dequant_out
 
     def _get_value_buffer(self, layer_id: int) -> torch.Tensor:
         v_packed = self.v_buffer[layer_id - self.start_layer]
         v_norms = self.v_scale_buffer[layer_id - self.start_layer]
         m, n = v_norms.shape
-        v_dequant = self.v_quantizer.dequantize(
-            v_packed.reshape(m * n, -1), v_norms.reshape(m * n)
+        out = self._v_dequant_out.reshape(m * n, self.v_head_dim)
+        self.v_quantizer.dequantize(
+            v_packed.reshape(m * n, -1), v_norms.reshape(m * n), out=out
         )
-        return v_dequant.reshape(m, n, self.v_head_dim)
+        return self._v_dequant_out
 
     # ------------------------------------------------------------------
     # KV cache write (quantise on write)
