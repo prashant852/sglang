@@ -642,7 +642,7 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
-                self.token_to_kv_pool = SWAKVPool(
+                swa_pool_kwargs = dict(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
                     page_size=self.page_size,
@@ -657,6 +657,10 @@ class ModelRunnerKVCacheMixin:
                     device=self.device,
                     **kwargs,
                 )
+                if self.server_args.kv_cache_dtype == "turboquant":
+                    swa_pool_kwargs["dtype"] = torch.bfloat16
+                    swa_pool_kwargs["token_to_kv_pool_class"] = MHATokenToKVPoolTurboQuant
+                self.token_to_kv_pool = SWAKVPool(**swa_pool_kwargs)
             elif config := self.mambaish_config:
                 extra_args = {}
                 if self.use_mla_backend:
